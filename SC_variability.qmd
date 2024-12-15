@@ -1,0 +1,460 @@
+---
+title: "Project 1"
+format: html
+editor: visual
+---
+
+# PROJECT 1 - The yeast Dataset
+
+Dataset built on expression data deriving from a scRNA-seq of a total of 844 *Saccharomyces cerevisiae* cells grown in different terrains
+
+The aim of the original experiment was to assess the effects of Mycophenolic acid (MPA), a lifespan extending compound, and the combination with guanine, MPA's epistatic agent, on global cell expression
+
+The goal of this project is to assess which biological processes are affected by the compounds mentioned above by building a "simple" classifier using gene expression levels as predictors.
+
+## setup
+
+```{r}
+filespath = "C:/Users/Simo/Desktop/brilli-project/1"
+knitr::opts_knit$set(root.dir = filespath)
+```
+
+```{r}
+#| output: false
+
+
+library(tidyverse)
+
+library(Seurat)
+library(gprofiler2)
+
+library(ComplexHeatmap)
+library(viridis)
+
+library(caTools)
+library(DescTools)
+
+
+#library(GeneOverlap)
+
+```
+
+## Data Loading
+
+Dataset creation with classic Seurat Read10x pipeline
+
+Due to data filtering during SeuratObject creation, cell number will is reduced from 844 to 811 and gene number from 4777 to 4673
+
+```{r}
+
+# try the seurat way 
+yeast_raw <- Read10X(data.dir = filespath,
+                     cell.column = 2, 
+                     unique.features = T) 
+
+#metadata <- read.table('metadata.tsv', sep = "\t", header = T)
+
+rawmeta <- read_tsv('metadata.tsv')
+barcodes <- rawmeta$...1
+cond <- rawmeta$sample
+metadata <- data.frame(condition = cond,row.names = barcodes)
+
+#colnames(metadata) <- c('barcode', 'condition')
+
+yst <- CreateSeuratObject(counts = yeast_raw, 
+                          assay = 'RNA',
+                          meta.data = metadata,
+                          min.cells = 3, 
+                          min.features = 200)
+
+
+dim(yeast_raw)
+dim(yst)
+table(yst@meta.data$condition)
+
+
+```
+
+## Normalization
+
+Using the new all-in-one [SCTransform](https://github.com/satijalab/sctransform) function. Normalizing expression data is necessary due to the difference in library size between cells, making them comparable
+
+```{r}
+#normalize, scale AIO
+yst <- SCTransform(yst, verbose = FALSE)
+```
+
+# 
+
+## PCA and UMAP
+
+Although finding more clusters that the real treatments, real ones can be seen by coloring cells according to the treatment. UMAP shows a very distinct cluster for MPA grown cells compared to other groups
+
+```{r}
+
+yst <- RunPCA(yst, verbose = FALSE)
+
+ElbowPlot(yst) # elbow is around 9-10 components
+
+DimPlot(yst,reduction = 'pca',
+        label = TRUE)+theme_minimal()
+
+DimPlot(yst,reduction = 'pca',
+        group.by = "condition",
+        label = TRUE)+theme_minimal()
+
+yst <- FindNeighbors(yst, dims = 1:20, verbose = FALSE)
+yst <- FindClusters(yst, verbose = FALSE)
+
+yst <- RunUMAP(yst, dims = 1:20, verbose = FALSE)
+# DimPlot(yst,reduction = 'umap', label = TRUE)
+
+```
+
+```{r}
+
+DimPlot(yst,
+        reduction="umap", 
+        #group.by = "ident", 
+        pt.size = 1.5,
+        label = TRUE, 
+        label.size = 3,
+        repel = T)+ 
+  theme_minimal()#+NoLegend()
+
+
+# grouping according to growth condition
+DimPlot(yst,reduction = 'umap',
+        group.by = "condition",
+        label = TRUE)+theme_minimal() 
+
+
+```
+
+# The classifier
+
+This simple model aim to predict the growth condition of cells by comparing a single cell expression profile with the average expression profile (signature) for the 4 terrains and assigning to one based on the minimum difference
+
+More in depth:
+
+-   model would be too complex if using all genes, and won't help to find out the most characterizing ones
+
+    -   there is a "feature selection" step: for **m** Principal Components , extracts **n** top genes sorted by absolute value of loadings that will be used for classification (that is, ordered by contribution to the variability in the dataset)
+
+-   Growth condition expression signature: for each gene, compute a terrain-specific mean expression by averaging expression levels for the cells belonging to that group
+
+-   Classification criterion: compute difference between a cell expression profile (for the selected genes) and every condition-specific signature. The cell will belong to the group where it has the minimum difference
+
+    -   Distance measure - Euclidean distance: square sum of all the differences between the cell and the signature
+
+-   compare results running the classifier with different number of genes and PCs by comparing model accuracy
+
+    -   accuracy= (TN+TP)/(TN+TP+FP+FN)
+
+```{r}
+#| output: false
+
+
+# let's run it a few times and see how it changes
+
+# initialize a df to store results
+accuracy_df <- data.frame(Accuracy = double(),
+                          n_PCs = integer(),
+                          TopLoads = integer(),
+                          nGenes = integer())
+
+# compute growth condition expression signature
+dmso_means <- rowMeans(yst@assays$SCT@scale.data[, yst$condition == "DMSO"])  %>% data.frame
+guanin_means <- rowMeans(yst@assays$SCT@scale.data[, yst$condition == "Guanine"]) %>% data.frame
+gmpa_means <- rowMeans(yst@assays$SCT@scale.data[, yst$condition == "Guanine_MPA"]) %>% data.frame
+mpa_means<- rowMeans(yst@assays$SCT@scale.data[, yst$condition == "MPA"]) %>% data.frame
+
+
+for (n_pcs in c(1:10, 20, 30,40,50)) {
+  for (top_load in c(3, 5, 10, 20, 50)) {
+    
+i<-1
+top_genes <- list(length = n_pcs)
+
+# from each of the seleced PCs, extract k genes with highes loadings
+for (i in 1:n_pcs) {
+  loadings <- data.frame(loads = yst@reductions$pca@feature.loadings[, i]) 
+  
+  df <- data.frame(gene = rownames(loadings), 
+                   abs_loading = abs(loadings$loads))
+  df <- arrange(df, desc(abs_loading))
+  
+  top_genes[i] <- list(head(df$gene, top_load)) 
+  }
+
+# retrive all unique gene names - will be used for the model
+all_top_genes <- unique(unlist(top_genes)) 
+
+
+# pull out growth condition expression signature
+# from the means df
+dmso_sig <- dmso_means[all_top_genes, ]
+guanin_sig <- guanin_means[all_top_genes, ]
+gmpa_sig <- gmpa_means[all_top_genes, ]
+mpa_sig<- mpa_means[all_top_genes, ]
+
+
+signatures <- data.frame(DMSO = dmso_sig,
+                         Guanin = guanin_sig,
+                         Guanin_MPA = gmpa_sig,
+                         MPA = mpa_sig
+                         )
+
+
+
+
+# compute distances of each cell from the signatures
+
+euc_dist <- apply(yst@assays$SCT@scale.data[all_top_genes, ], 
+                  MARGIN = 2, 
+                  function(cell) {
+                      
+                      dist_dmso <- sum((cell - dmso_sig)^2)
+                      dist_guanin <- sum((cell - guanin_sig)^2)
+                      dist_gmpa <- sum((cell - gmpa_sig)^2)
+                      dist_mpa <- sum((cell - mpa_sig)^2)
+  
+                    return(c(dist_dmso, 
+                             dist_guanin, 
+                             dist_gmpa, 
+                             dist_mpa)
+                           )
+                      })
+
+euc_dist <- data.frame(euc_dist, row.names = c("DMSO","Guanine","Guanine_MPA","MPA"))
+
+prediction <- apply(euc_dist, 
+                    MARGIN = 2, 
+                    FUN = function(diff) {rownames(euc_dist[which.min(diff),])})
+
+#table(yst$condition, prediction)
+
+# compute accuracy of the classifier
+accuracy <- sum(yst$condition == prediction)/811
+
+accuracy_row <- list(Accuracy = accuracy,
+                     n_PCs = n_pcs, 
+                     TopLoads = top_load,
+                     nGenes = length(all_top_genes))
+
+# update results df
+accuracy_df <- rbind(accuracy_df, accuracy_row)
+
+
+      }
+  
+  }
+
+
+#accuracy_df
+```
+
+## Performance
+
+from the following plot we can observe that:
+
+-   to start getting a bare minimum precision \> 75% at least 105 genes are needed
+
+    -   increasing gene number increases accuracy
+
+    -   best score of 86% accuracy is obtained with 1287 genes, top 50 ones of the first 50 PCs
+
+    -   interesting local maximum at 229 genes (20 top genes for 20 PCs), with almost 80% accuracy
+
+```{r}
+ggplot(accuracy_df, aes(x =nGenes , y = Accuracy ))+
+  geom_point(aes(color =n_PCs))+
+  geom_line(lty = 'dashed')+
+  scale_color_viridis()+
+  #geom_vline(xintercept = 229, lty = 'dotted' )+
+  theme_minimal()
+```
+
+```{r}
+
+# explore a bit these results
+accuracy_df[accuracy_df$Accuracy > .8,] %>% arrange(., nGenes)
+
+```
+
+From the table above, let's focus our attention on first three rows that are the ones with:
+
+-   accuracy score \> 0.8
+
+-   number of genes \< 500
+
+that translates in an *acceptable* model without raising complexity too much.
+
+Subset associated gene lists for subsequent Over-Representation Analysis (ORA)
+
+nb. I'll also add the last row, the one with both highest accuracy and number of genes to compare enrichment results
+
+```{r}
+
+get_pca_genes <- function(pcs, topn) {
+
+i<-1
+top_genes2 <- list(length = pcs)
+
+# from each of the seleced PCs, extract k genes with highes loadings
+for (i in 1:pcs) {
+  loadings2 <- data.frame(loads = yst@reductions$pca@feature.loadings[, i]) 
+  
+  loadings_df2 <- data.frame(gene = rownames(loadings2), 
+                   abs_loading = abs(loadings2$loads))
+  loadings_df2 <- arrange(loadings_df2, desc(abs_loading))
+  
+  top_genes2[i] <- list(head(loadings_df2$gene, topn)) 
+  }
+
+# retrive all unique gene names - will be used for the model
+all_top_genes2 <- unique(unlist(top_genes2)) 
+  
+  }
+
+
+
+```
+
+```{r}
+accuracy_df[accuracy_df$Accuracy > .8,] %>% 
+  arrange(., nGenes) %>% .[c(1:3,8),2:3]  -> genes_to_retrive
+gene_sets <- list()
+
+i<-1
+for (i in 1:dim(genes_to_retrive)[1]) {
+  
+  c(genes_to_retrive[i,]) %>% unname() %>% unlist() -> tmp
+  gene_sets[[i]] <- get_pca_genes(tmp[1], tmp[2]) 
+  
+} 
+
+# double check by dimension
+#lapply(gene_sets,length ) %>% unlist
+#accuracy_df[accuracy_df$Accuracy > .8,] %>% arrange(., nGenes) 
+# all good
+```
+
+## Enrichment - ORA
+
+```{r}
+
+enriched_results <- gost(gene_sets,
+                         organism = 'scerevisiae',
+                         multi_query = F, 
+                         evcodes = T,
+                         highlight = T,
+                         exclude_iea = T,# inferred terms
+                         #custom_bg = rownames(yst)
+                         )
+```
+
+and also providing all genes in the starting count table as the background set
+
+```{r}
+
+# setting all genes in the count table as background set
+enriched_results_bg <- gost(gene_sets,
+                           organism = 'scerevisiae',
+                           multi_query = F, 
+                           evcodes = T,
+                           highlight = T,
+                           exclude_iea = T,# inferred terms
+                           custom_bg = rownames(yst)
+                           )
+```
+
+```{r}
+# not the best plotting function but it'll do the job
+# still better than the default manhattan plot
+
+# extract significant results and show them 
+
+plot_from_gost <- function(gost_result, 
+                           annDB = c("GO:BP","GO:CC","GO:MF",
+                                     "KEGG","WP","HP"), #"TF"
+                           #curated_only = F,
+                           highlighted_only = F,
+                           top_res = 10) {
+  
+  gost_result <- gost_result$result[gost_result$result$significant == T,]
+  gost_result <- gost_result[gost_result$source %in% annDB,]
+  
+  if (highlighted_only == T) {
+    gost_result <- gost_result[gost_result$highlighted == TRUE,]
+  }
+  
+  gost_result <- gost_result %>% 
+    group_by(query) %>%
+    arrange(desc(intersection_size)) %>% 
+    slice_head(n = top_res) %>% 
+    ungroup()
+
+gost_result$term_name <- factor(gost_result$term_name,
+                                levels = unique(gost_result$term_name))
+
+ggplot(gost_result, aes(x = intersection_size, 
+                           y = term_name, 
+                           fill = -log10(p_value) ))+
+  scale_fill_viridis(option = 'magma', 
+                     direction = 1,
+                     #limits = c(0,50)
+                     )+
+  geom_bar(stat = 'identity') +
+  ggplot2::facet_grid(~query, 
+                      axes = 'all_y',
+                      axis.labels = 'margins')#+labs(title = annDB)
+}
+```
+
+```{r}
+#annDB = c("GO:BP","GO:CC","GO:MF","KEGG","WP","TF","HP")
+#
+
+plot_from_gost(enriched_results, top_res = 5, highlighted_only = T)+
+  ggtitle('Overview')
+plot_from_gost(enriched_results, annDB = "GO:BP") + ggtitle("GO:BP")
+plot_from_gost(enriched_results, annDB = "GO:CC") + ggtitle("GO:CC")
+
+# i'm sorry if this will be terribly rendered in html
+plot_from_gost(enriched_results, annDB = "GO:MF") + ggtitle("GO:MF")
+plot_from_gost(enriched_results, annDB = "KEGG") + ggtitle("KEGG")
+plot_from_gost(enriched_results, annDB = "WP") + ggtitle("WP")
+
+```
+
+```{r}
+# excluded some plots for lack of results
+#plot_from_gost(enriched_results_bg, annDB = "GO:BP") + ggtitle("GO:BP")
+#plot_from_gost(enriched_results_bg, annDB = "GO:MF") + ggtitle("GO:MF")
+
+plot_from_gost(enriched_results_bg, top_res = 5, highlighted_only = F)+
+  ggtitle('Overview')
+plot_from_gost(enriched_results_bg, annDB = "GO:CC") + ggtitle("GO:CC")
+plot_from_gost(enriched_results_bg, annDB = "KEGG") + ggtitle("KEGG")
+plot_from_gost(enriched_results_bg, annDB = "WP") + ggtitle("WP")
+
+```
+
+## Discussion
+
+Most present enriched terms in for the selected gene lists relate to:
+
+-   Cell wall and membrane
+
+-   Ribosomes and other organelles
+
+-   Amminoacid biosynthesis
+
+    -   serin acts as a precursor for the biosynthesis of other aminoacids
+
+-   Carbon metabolism, glycolyisis and gluconeogenesis
+
+Cell wall, membrane and organelle related genes may suggest a relation with cell division while
+
+Cell cycle might not be the only driving force of separation since we can observe some terms possibly related with specific effects of the MPA treatment. Ribosome-associated terms might relate to the negative impact of MPA on ribosomes biogenesis, as stated in the reference article, while the presence of terms related to glycolysis, gluconeogenesis and amminoacid metabolism, although not being very specific, may be subordinate to the depleting effect of MPA over GTP^[\[1\]](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6908259/)^
